@@ -1,0 +1,20 @@
+version: '3'
+services:
+  web:
+    build: .
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./model.pth.tar:/app/model.pth.tar:ro
+      - ./uploads:/app/uploads
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=production
+      - MODEL_PATH=/app/model.pth.tar
+      - ENABLE_SEGMENTATION=true
+      # Add this to allow host.docker.internal to work
+      - DOCKER_HOST=host.docker.internal
+    restart: unless-stopped
+    # For Linux hosts, uncomment these lines:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
