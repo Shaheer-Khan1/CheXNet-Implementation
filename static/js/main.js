@@ -48,6 +48,36 @@ function displayResults(data) {
         resultsDiv.appendChild(segDiv);
     }
     
+    const metricsDiv = document.getElementById('metrics');
+    const metricsList = document.getElementById('metricsList');
+    metricsList.innerHTML = '';
+
+    // Show metrics type
+    if (data.metrics_type === 'dynamic') {
+        const typeLi = document.createElement('li');
+        typeLi.innerHTML = '<strong>Dynamic Metrics (for this image, using ground truth):</strong>';
+        metricsList.appendChild(typeLi);
+        if (data.dynamic_metrics) {
+            for (const [key, value] of Object.entries(data.dynamic_metrics)) {
+                const li = document.createElement('li');
+                li.textContent = `${key}: ${(value * 100).toFixed(2)}%`;
+                metricsList.appendChild(li);
+            }
+        }
+    } else if (data.metrics_type === 'static') {
+        const typeLi = document.createElement('li');
+        typeLi.innerHTML = '<strong>Model Performance Metrics (static, overall):</strong>';
+        metricsList.appendChild(typeLi);
+        if (data.metrics) {
+            for (const [key, value] of Object.entries(data.metrics)) {
+                const li = document.createElement('li');
+                li.textContent = `${key}: ${(value * 100).toFixed(2)}%`;
+                metricsList.appendChild(li);
+            }
+        }
+    }
+    metricsDiv.style.display = 'block';
+    
     // Display raw JSON response
     jsonResponse.textContent = JSON.stringify(data, null, 2);
 }

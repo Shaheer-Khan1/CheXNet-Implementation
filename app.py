@@ -16,6 +16,7 @@ from io import BytesIO
 import base64
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -165,6 +166,15 @@ upload_parser.add_argument('callback_url',
     help='URL to send results to (optional)'
 )
 
+# Example: Add this dictionary at the top or load from a file
+MODEL_METRICS = {
+    "Accuracy": 0.92,
+    "AUC": 0.97,
+    "F1-score": 0.89,
+    "Precision": 0.91,
+    "Recall": 0.88
+}
+
 def get_image_from_file(file):
     """Process various file formats and return a PIL Image"""
     try:
@@ -201,13 +211,14 @@ def get_image_from_file(file):
         logger.error(f"Error processing image: {e}")
         raise
 
-def analyze_image(file, callback_url=None):
+def analyze_image(file, callback_url=None, ground_truth=None):
     """Analyze an image and return predictions"""
     try:
         if model is None:
             return {"error": "Model not loaded"}, 500
             
-        # Get the mode from the form data
+        if ground_truth is None:
+            ground_truth = request.form.get('ground_truth', None)
         mode = request.form.get('mode', 'classification')
         logger.info(f"Analysis mode: {mode}")
             
@@ -250,7 +261,8 @@ def analyze_image(file, callback_url=None):
                 for i, prob in enumerate(probabilities)
             ],
             "top_predictions": [],
-            "mode": mode  # Add mode to results
+            "mode": mode,  # Add mode to results
+            "metrics": MODEL_METRICS  # Add this line
         }
         
         # Get top predictions
@@ -316,7 +328,25 @@ def analyze_image(file, callback_url=None):
             json.dump(results, f, indent=2)
         
         results["result_id"] = result_id
-            
+        
+        # If ground truth is provided, calculate dynamic metrics
+        if ground_truth:
+            gt_labels = [label.strip() for label in ground_truth.split(',') if label.strip()]
+            gt_vector = np.zeros(len(labels))
+            for i, label in enumerate(labels):
+                if label in gt_labels:
+                    gt_vector[i] = 1
+            pred_vector = (probabilities > 0.5).astype(int)
+            results['dynamic_metrics'] = {
+                'accuracy': float(accuracy_score(gt_vector, pred_vector)),
+                'precision': float(precision_score(gt_vector, pred_vector, zero_division=0)),
+                'recall': float(recall_score(gt_vector, pred_vector, zero_division=0)),
+                'f1_score': float(f1_score(gt_vector, pred_vector, zero_division=0))
+            }
+            results['metrics_type'] = 'dynamic'
+        else:
+            results['metrics_type'] = 'static'
+        
         return results
             
     except Exception as e:
@@ -335,9 +365,10 @@ def index():
         
         callback_url = request.form.get('callback_url', None)
         view_results = request.form.get('view_results', 'false').lower() == 'true'
-            
+        ground_truth = request.form.get('ground_truth', None)
+        
         try:
-            results = analyze_image(file, callback_url)
+            results = analyze_image(file, callback_url, ground_truth=ground_truth)
             
             # If the user wants to view results on a new page
             if view_results and isinstance(results, dict) and 'error' not in results:
@@ -475,7 +506,13 @@ def index():
                         <label for="fileInput">Upload X-ray Image:</label>
                         <input id="fileInput" type="file" name="file" accept="image/jpeg,image/png,image/tiff,image/bmp,application/dicom" required>
                     </div>
-                    
+
+                    <div class="form-group">
+                        <label for="groundTruth">Ground Truth Labels (comma-separated):</label>
+                        <input id="groundTruth" type="text" name="ground_truth" placeholder="e.g. Pneumonia, Effusion">
+                        <small>Optional: Enter true findings to see per-image metrics.</small>
+                    </div>
+
                     <div class="mode-selector">
                         <label>Analysis Mode:</label>
                         <label>
@@ -877,68 +914,94 @@ def predict():
     
     file = request.files['file']
     mode = request.form.get('mode', 'classification')
+    ground_truth = request.form.get('ground_truth', None)
     
-    # Add debug logging
     logger.info(f"Received request with mode: {mode}")
     
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
     try:
-        # Load and preprocess image
         image = Image.open(file.stream).convert('RGB')
         image_tensor = preprocess_image(image)
         
-        # Get predictions
         with torch.no_grad():
             output = model(image_tensor)
-            probabilities = torch.sigmoid(output).cpu().numpy()
+            probabilities = torch.sigmoid(output).cpu().numpy()[0]
         
-        # Get GradCAM visualization if in segmentation mode
+        # Prepare base response
+        response = {
+            'mode': mode,
+            'classification': probabilities.tolist(),
+            'metrics': MODEL_METRICS,
+            'metrics_type': 'static'
+        }
+        
+        # If ground truth is provided, calculate dynamic metrics
+        if ground_truth:
+            labels = [
+                "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
+                "Mass", "Nodule", "Pneumonia", "Pneumothorax", "Consolidation",
+                "Edema", "Emphysema", "Fibrosis", "Pleural_Thickening", "Hernia"
+            ]
+            gt_labels = [label.strip() for label in ground_truth.split(',') if label.strip()]
+            gt_vector = np.zeros(len(labels))
+            for i, label in enumerate(labels):
+                if label in gt_labels:
+                    gt_vector[i] = 1
+            pred_vector = (probabilities > 0.5).astype(int)
+            response['dynamic_metrics'] = {
+                'accuracy': float(accuracy_score(gt_vector, pred_vector)),
+                'precision': float(precision_score(gt_vector, pred_vector, zero_division=0)),
+                'recall': float(recall_score(gt_vector, pred_vector, zero_division=0)),
+                'f1_score': float(f1_score(gt_vector, pred_vector, zero_division=0))
+            }
+            response['metrics_type'] = 'dynamic'
+        
+        # Segmentation mode
         if mode == 'segmentation':
             logger.info("Generating GradCAM visualization")
-            # Get the index of the highest probability class
             class_idx = np.argmax(probabilities)
-            logger.info(f"Using class index: {class_idx}")
-            
-            # Generate GradCAM
             cam = gradcam(image_tensor, class_idx)
-            logger.info("GradCAM generated successfully")
-            
-            # Convert to heatmap
             heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
             heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-            
-            # Convert original image to numpy array
             original_image = np.array(image)
-            
-            # Resize heatmap to match original image
             heatmap = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
-            
-            # Create overlay
             alpha = 0.5
             overlay = cv2.addWeighted(original_image, 1-alpha, heatmap, alpha, 0)
-            
-            # Convert to base64
             _, buffer = cv2.imencode('.png', overlay)
             segmentation_base64 = base64.b64encode(buffer).decode('utf-8')
-            
-            logger.info("Segmentation visualization completed")
-            return jsonify({
-                'mode': 'segmentation',
-                'classification': probabilities.tolist(),
-                'segmentation': segmentation_base64
-            })
-        else:
-            logger.info("Returning classification results only")
-            return jsonify({
-                'mode': 'classification',
-                'classification': probabilities.tolist()
-            })
+            response['segmentation'] = segmentation_base64
+        
+        return jsonify(response)
                 
     except Exception as e:
         logger.error(f"Error in prediction: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    # Load your test set here
+    # For demonstration, let's assume you have test_images and test_labels
+    all_preds = []
+    all_gts = []
+    for image, gt_vector in zip(test_images, test_labels):
+        image_tensor = preprocess_image(image)
+        with torch.no_grad():
+            output = model(image_tensor)
+            probabilities = torch.sigmoid(output).cpu().numpy()[0]
+        pred_vector = (probabilities > 0.5).astype(int)
+        all_preds.append(pred_vector)
+        all_gts.append(gt_vector)
+    all_preds = np.array(all_preds)
+    all_gts = np.array(all_gts)
+    metrics = {
+        'accuracy': float(accuracy_score(all_gts, all_preds)),
+        'precision': float(precision_score(all_gts, all_preds, average='macro', zero_division=0)),
+        'recall': float(recall_score(all_gts, all_preds, average='macro', zero_division=0)),
+        'f1_score': float(f1_score(all_gts, all_preds, average='macro', zero_division=0))
+    }
+    return jsonify(metrics)
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=5001)

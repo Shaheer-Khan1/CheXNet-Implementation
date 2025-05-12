@@ -19,4 +19,23 @@
 .segmentation h3 {
     margin-bottom: 15px;
     color: #333;
+}
+
+#metrics {
+    margin-top: 20px;
+    padding: 15px;
+    background: #eef6fa;
+    border-radius: 8px;
+    border: 1px solid #b3d1e6;
+}
+#metrics h3 {
+    margin-bottom: 10px;
+}
+#metricsList {
+    list-style: none;
+    padding-left: 0;
+}
+#metricsList li {
+    margin-bottom: 5px;
+    font-weight: 500;
 } 
