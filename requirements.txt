@@ -12,3 +12,6 @@ requests
 
 # For GradCAM visualization
 scikit-learn
+wheel
+efficientnet_pytorch
+fpdf

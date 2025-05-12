@@ -17,6 +17,9 @@ import base64
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from efficientnet_pytorch import EfficientNet
+from dotenv import load_dotenv
+from fpdf import FPDF
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,11 +36,10 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Create results directory for output JSON files
 os.makedirs('results', exist_ok=True)
 
-# Initialize model
-model = None
-model_path = os.getenv('MODEL_PATH', 'model.pth.tar')
+# Global model registry
+models_dict = {}
 
-# Add this class definition before the load_model function
+# Add this class definition before the load_models function
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -91,38 +93,30 @@ class GradCAM:
         
         return cam
 
-def load_model():
-    global model, gradcam
-    try:
-        logger.info(f"Loading model from {model_path}")
-        checkpoint = torch.load(model_path, map_location="cpu")
-        
-        # Initialize DenseNet-121
-        model = models.densenet121(pretrained=False)
-        num_ftrs = model.classifier.in_features
-        model.classifier = torch.nn.Linear(num_ftrs, 14)
-        
-        # Load state dictionary
-        state_dict = checkpoint.get('state_dict', checkpoint)
-        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict, strict=False)
-        model.eval()
-        
-        # Initialize GradCAM with the last DenseNet block
-        target_layer = model.features.denseblock4
-        gradcam = GradCAM(model, target_layer)
-        
-        # Verify GradCAM initialization
-        logger.info("GradCAM initialized with target layer: %s", target_layer)
-        
-        logger.info("Model loaded successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        return False
+def load_models():
+    global models_dict, gradcam
+    # Load DenseNet-121
+    densenet = models.densenet121(pretrained=False)
+    num_ftrs = densenet.classifier.in_features
+    densenet.classifier = torch.nn.Linear(num_ftrs, 14)
+    densenet_ckpt = torch.load('model.pth.tar', map_location="cpu")
+    densenet.load_state_dict({k.replace("module.", ""): v for k, v in densenet_ckpt.get('state_dict', densenet_ckpt).items()}, strict=False)
+    densenet.eval()
+    models_dict['densenet'] = densenet
 
-# Load model at startup
-load_model()
+    # Load EfficientNetB4
+    efficientnet = EfficientNet.from_name('efficientnet-b4', num_classes=14)
+    if os.path.exists('efficientnet_b4.pth'):
+        efficientnet.load_state_dict(torch.load('efficientnet_b4.pth', map_location="cpu"))
+    efficientnet.eval()
+    models_dict['efficientnet'] = efficientnet
+
+    # Default GradCAM for DenseNet
+    target_layer = densenet.features.denseblock4
+    gradcam = GradCAM(densenet, target_layer)
+
+# Load models at startup
+load_models()
 
 # Create Swagger API
 api = Api(app, 
@@ -211,10 +205,64 @@ def get_image_from_file(file):
         logger.error(f"Error processing image: {e}")
         raise
 
-def analyze_image(file, callback_url=None, ground_truth=None):
+def generate_xray_report(predictions):
+    mistral_api_key = os.getenv("MISTRAL_API_KEY")
+    findings = "\n".join(
+        f"- {pred['label']}: {pred['probability']*100:.1f}%"
+        for pred in predictions
+    )
+    prompt = (
+        f"Given the following findings from a chest X-ray model:\n"
+        f"{findings}\n"
+        f"Generate a detailed, professional radiology report for this patient."
+    )
+
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {mistral_api_key}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "mistral-large-latest",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 512,
+        "temperature": 0.7
+    }
+    response = requests.post(url, headers=headers, json=data)
+    response.raise_for_status()
+    result = response.json()
+    return result["choices"][0]["message"]["content"]
+
+def generate_gemini_report(predictions):
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    findings = "\n".join(
+        f"- {pred['label']}: {pred['probability']*100:.1f}%"
+        for pred in predictions
+    )
+    prompt = (
+        f"Given the following findings from a chest X-ray model:\n"
+        f"{findings}\n"
+        f"Generate a detailed, professional radiology report for this patient."
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_api_key}"
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    response = requests.post(url, headers=headers, json=data)
+    response.raise_for_status()
+    result = response.json()
+    # Extract the generated report (Gemini's response structure)
+    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+def analyze_image(file, callback_url=None, ground_truth=None, model_choice='densenet'):
     """Analyze an image and return predictions"""
     try:
-        if model is None:
+        if models_dict.get('densenet') is None:
             return {"error": "Model not loaded"}, 500
             
         if ground_truth is None:
@@ -241,6 +289,16 @@ def analyze_image(file, callback_url=None, ground_truth=None):
         
         # Preprocess and predict
         input_tensor = transform(image).unsqueeze(0)
+        if model_choice not in models_dict:
+            model_choice = 'densenet'
+        model = models_dict[model_choice]
+        # For GradCAM, set the correct target layer
+        if model_choice == 'densenet':
+            target_layer = model.features.denseblock4
+        else:  # EfficientNet
+            target_layer = model._blocks[-1]
+        global gradcam
+        gradcam = GradCAM(model, target_layer)
         with torch.no_grad():
             output = model(input_tensor)
         
@@ -347,6 +405,14 @@ def analyze_image(file, callback_url=None, ground_truth=None):
         else:
             results['metrics_type'] = 'static'
         
+        # Generate and save PDF using result_id
+        try:
+            report = generate_xray_report(results["predictions"])
+            pdf_path = os.path.join('results', f"{result_id}.pdf")
+            save_llm_report_pdf(report, pdf_path, findings=results["predictions"])
+        except Exception as e:
+            logger.error(f"Error generating LLM report: {e}")
+        
         return results
             
     except Exception as e:
@@ -366,9 +432,10 @@ def index():
         callback_url = request.form.get('callback_url', None)
         view_results = request.form.get('view_results', 'false').lower() == 'true'
         ground_truth = request.form.get('ground_truth', None)
+        model_choice = request.form.get('model_choice', 'densenet')
         
         try:
-            results = analyze_image(file, callback_url, ground_truth=ground_truth)
+            results = analyze_image(file, callback_url, ground_truth=ground_truth, model_choice=model_choice)
             
             # If the user wants to view results on a new page
             if view_results and isinstance(results, dict) and 'error' not in results:
@@ -536,7 +603,28 @@ def index():
                         </label>
                     </div>
                     
+                    <div class="form-group">
+                        <label>Model:</label>
+                        <label>
+                            <input type="radio" name="model_choice" value="densenet" checked> DenseNet-121
+                        </label>
+                        <label>
+                            <input type="radio" name="model_choice" value="efficientnet"> EfficientNet-B4
+                        </label>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="llm_choice">Report Generator:</label>
+                        <select id="llm_choice" name="llm_choice">
+                            <option value="mistral" selected>Mistral</option>
+                            <option value="gemini">Gemini</option>
+                        </select>
+                    </div>
+                    
                     <button type="submit" class="upload-btn">Analyze Image</button>
+                    <button type="button" id="generateReportBtn" class="upload-btn" style="margin-left:10px;">
+                        Generate Report
+                    </button>
                 </form>
             </div>
             <div id="error" class="error"></div>
@@ -555,12 +643,18 @@ def index():
             "Edema", "Emphysema", "Fibrosis", "Pleural_Thickening", "Hernia"
         ];
 
+        let latestResultId = null;
+
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
             e.preventDefault();
             const formData = new FormData(this);
             const viewResults = document.getElementById('viewResults').checked;
             const mode = document.querySelector('input[name="mode"]:checked').value;
+            const modelChoice = document.querySelector('input[name="model_choice"]:checked').value;
+            const llmChoice = document.getElementById('llm_choice').value;
             formData.append('mode', mode);
+            formData.append('model_choice', modelChoice);
+            formData.append('llm_choice', llmChoice);
             
             console.log('Selected mode:', mode);  // Debug log
             
@@ -629,6 +723,10 @@ def index():
                     
                     // Display raw JSON
                     jsonResponse.textContent = JSON.stringify(data, null, 2);
+
+                    if (data.result_id) {
+                        latestResultId = data.result_id;
+                    }
                 })
                 .catch(error => {
                     console.error('Error:', error);
@@ -636,6 +734,14 @@ def index():
                     errorDiv.textContent = error.message;
                     errorDiv.style.display = 'block';
                 });
+            }
+        });
+
+        document.getElementById('generateReportBtn').addEventListener('click', function() {
+            if (latestResultId) {
+                window.open(`/download_report/${latestResultId}`, '_blank');
+            } else {
+                alert("Please analyze an image first to generate a report.");
             }
         });
         </script>
@@ -915,6 +1021,7 @@ def predict():
     file = request.files['file']
     mode = request.form.get('mode', 'classification')
     ground_truth = request.form.get('ground_truth', None)
+    model_choice = request.form.get('model_choice', 'densenet')
     
     logger.info(f"Received request with mode: {mode}")
     
@@ -926,7 +1033,7 @@ def predict():
         image_tensor = preprocess_image(image)
         
         with torch.no_grad():
-            output = model(image_tensor)
+            output = models_dict['densenet'](image_tensor)
             probabilities = torch.sigmoid(output).cpu().numpy()[0]
         
         # Prepare base response
@@ -988,7 +1095,7 @@ def metrics():
     for image, gt_vector in zip(test_images, test_labels):
         image_tensor = preprocess_image(image)
         with torch.no_grad():
-            output = model(image_tensor)
+            output = models_dict['densenet'](image_tensor)
             probabilities = torch.sigmoid(output).cpu().numpy()[0]
         pred_vector = (probabilities > 0.5).astype(int)
         all_preds.append(pred_vector)
@@ -1003,5 +1110,32 @@ def metrics():
     }
     return jsonify(metrics)
 
+def save_llm_report_pdf(report_text, output_path, findings=None):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, "AI-Generated Chest X-ray Report", ln=True, align="C")
+    pdf.ln(10)
+    if findings:
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "Findings:", ln=True)
+        pdf.set_font("Arial", size=12)
+        for finding in findings:
+            pdf.cell(0, 10, f"- {finding['label']}: {finding['probability']*100:.1f}%", ln=True)
+        pdf.ln(5)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Radiology Report:", ln=True)
+    pdf.set_font("Arial", size=12)
+    for line in report_text.split('\n'):
+        pdf.multi_cell(0, 10, line)
+    pdf.output(output_path)
+
+@app.route('/download_report/<result_id>')
+def download_report(result_id):
+    pdf_path = os.path.join('results', f"{result_id}.pdf")
+    if not os.path.exists(pdf_path):
+        return "Report not found", 404
+    return send_file(pdf_path, as_attachment=True, download_name="xray_report.pdf")
+
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(debug=True, host='0.0.0.0', port=5000)
